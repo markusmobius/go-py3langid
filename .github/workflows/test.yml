@@ -1,0 +1,49 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - run: go vet ./...
+      - if: runner.os == 'Linux'
+        run: go test -race ./...
+  parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Read upstream pin
+        id: upstream
+        run: python -c "import json,os; pin=json.load(open('testdata/py3langid_cases.json'))['commit']; print('Pinned upstream:',pin); open(os.environ['GITHUB_OUTPUT'],'a').write('commit='+pin+'\n')"
+      - uses: actions/checkout@v4
+        with:
+          repository: adbar/py3langid
+          ref: ${{ steps.upstream.outputs.commit }}
+          path: .reference/py3langid
+      - run: python -m pip install -r scripts/requirements-parity.txt
+      - run: python -m pip install --no-deps ./.reference/py3langid
+      - run: python scripts/compare_py3langid.py --reference .reference/py3langid

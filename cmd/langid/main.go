@@ -1,0 +1,625 @@
+package main
+
+import (
+	"bufio"
+	"encoding/csv"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"os/exec"
+	"runtime"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/markusmobius/go-py3langid"
+	"github.com/markusmobius/go-py3langid/service"
+	"github.com/markusmobius/go-py3langid/urlclass"
+	"golang.org/x/term"
+)
+
+const defaultMaxInputBytes int64 = 4 << 20
+
+var errInputTooLarge = errors.New("input exceeds configured byte limit")
+
+var isTerminal = func(fd int) bool {
+	if os.Getenv("FORCE_TTY") == "1" {
+		return true
+	}
+	return term.IsTerminal(fd)
+}
+
+func processInput(id *py3langid.Identifier, data []byte, dist, normalize bool) {
+	if dist {
+		results, err := id.RankBytes(data)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "rank: %v\n", err)
+			return
+		}
+		fmt.Print("[")
+		for i, r := range results {
+			if i > 0 {
+				fmt.Print(", ")
+			}
+			if normalize {
+				fmt.Printf("('%s', %.4f)", r.Language, r.Score)
+			} else {
+				fmt.Printf("('%s', %.1f)", r.Language, r.Score)
+			}
+		}
+		fmt.Println("]")
+	} else {
+		if normalize {
+			results, err := id.RankBytes(data)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "rank: %v\n", err)
+				return
+			}
+			fmt.Printf("('%s', %.4f)\n", results[0].Language, results[0].Score)
+		} else {
+			res, err := id.IdentifyBytes(data)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "classify: %v\n", err)
+				return
+			}
+			fmt.Printf("('%s', %.1f)\n", res.Language, res.Score)
+		}
+	}
+}
+
+func preprocessArgs(args []string) []string {
+	var preprocessed []string
+	for _, arg := range args {
+		if arg == "-l" || arg == "--l" {
+			preprocessed = append(preprocessed, "--langs")
+		} else if strings.HasPrefix(arg, "-l=") || strings.HasPrefix(arg, "--l=") {
+			val := strings.TrimPrefix(strings.TrimPrefix(arg, "-l="), "--l=")
+			preprocessed = append(preprocessed, "--langs", val)
+		} else if strings.HasPrefix(arg, "-vv") && strings.Trim(arg[1:], "v") == "" {
+			for range len(arg) - 1 {
+				preprocessed = append(preprocessed, "-v")
+			}
+		} else {
+			preprocessed = append(preprocessed, arg)
+		}
+	}
+	return preprocessed
+}
+
+type verbosityFlag int
+
+func (value *verbosityFlag) String() string   { return strconv.Itoa(int(*value)) }
+func (value *verbosityFlag) IsBoolFlag() bool { return true }
+func (value *verbosityFlag) Set(string) error { *value++; return nil }
+
+func main() {
+	var (
+		modelPath     string
+		mPath         string
+		lineMode      bool
+		batchMode     bool
+		bMode         bool
+		langs         string
+		dist          bool
+		dMode         bool
+		normalize     bool
+		nMode         bool
+		format        string
+		fFormat       string
+		ignoreMissing bool
+		maxInputBytes int64
+
+		serve     bool
+		demo      bool
+		remote    bool
+		host      string
+		port      int
+		urlTarget string
+		uTarget   string
+		verbosity verbosityFlag
+	)
+
+	flag.StringVar(&modelPath, "model", "", "path to .lidg model (optional, uses default if omitted)")
+	flag.StringVar(&mPath, "m", "", "path to .lidg model (alias for -model)")
+	flag.BoolVar(&lineMode, "line", false, "classify each input line")
+	flag.BoolVar(&batchMode, "batch", false, "batch mode: treat stdin lines as file paths to classify")
+	flag.BoolVar(&bMode, "b", false, "batch mode: treat stdin lines as file paths to classify (alias for -batch)")
+	flag.StringVar(&langs, "langs", "", "comma-separated set of target ISO639 language codes (e.g en,de)")
+	flag.BoolVar(&dist, "dist", false, "show full distribution over languages (rank mode)")
+	flag.BoolVar(&dMode, "d", false, "show full distribution over languages (rank mode) (alias for -dist)")
+	flag.BoolVar(&normalize, "normalize", false, "normalize confidence scores to probability values (0.0 to 1.0)")
+	flag.BoolVar(&nMode, "n", false, "normalize confidence scores to probability values (0.0 to 1.0) (alias for -normalize)")
+	flag.StringVar(&format, "format", "csv", "output format for batch mode: csv, jsonl, or classic")
+	flag.StringVar(&fFormat, "f", "", "output format for batch mode: classic, csv, or jsonl (alias for -format)")
+	flag.BoolVar(&ignoreMissing, "ignore-missing", false, "silently skip missing or unreadable files in batch mode")
+	flag.Int64Var(&maxInputBytes, "max-bytes", defaultMaxInputBytes, "maximum bytes read per stdin, file, request, or URL body (<=0 disables limit)")
+
+	flag.BoolVar(&serve, "serve", false, "start HTTP service mode")
+	flag.BoolVar(&serve, "s", false, "start HTTP service mode")
+	flag.BoolVar(&demo, "demo", false, "start HTTP service mode and open demo page in web browser")
+	flag.BoolVar(&remote, "remote", false, "resolve and bind to outward-facing local IP address if no host is specified")
+	flag.BoolVar(&remote, "r", false, "resolve an outward-facing local IP address")
+	flag.Var(&verbosity, "v", "increase diagnostic verbosity (repeatable)")
+	flag.StringVar(&host, "host", "", "host to bind HTTP service to (defaults to 127.0.0.1 unless --remote is set)")
+	flag.IntVar(&port, "port", 9008, "port to bind HTTP service to")
+	flag.StringVar(&urlTarget, "url", "", "classify the content of a URL")
+	flag.StringVar(&uTarget, "u", "", "classify the content of a URL (alias for -url)")
+
+	flag.Usage = func() {
+		fmt.Fprintf(os.Stderr, "Usage of %s:\n", os.Args[0])
+		fmt.Fprintln(os.Stderr, "  -m, -model string\n    \tpath to .lidg model (optional, uses default if omitted)")
+		fmt.Fprintln(os.Stderr, "  -l, --langs string\n    \tcomma-separated set of target ISO639 language codes (e.g en,de)")
+		fmt.Fprintln(os.Stderr, "      --line\n    \tclassify each input line")
+		fmt.Fprintln(os.Stderr, "  -b, --batch\n    \tbatch mode: treat stdin lines as file paths to classify")
+		fmt.Fprintln(os.Stderr, "  -d, --dist\n    \tshow full distribution over languages (rank mode)")
+		fmt.Fprintln(os.Stderr, "  -n, --normalize\n    \tnormalize confidence scores to probability values (0.0 to 1.0)")
+		fmt.Fprintln(os.Stderr, "  -f, --format string\n    \toutput format for batch mode: csv, jsonl, or classic (default \"csv\")")
+		fmt.Fprintln(os.Stderr, "      --ignore-missing\n    \tsilently skip missing or unreadable files in batch mode")
+		fmt.Fprintln(os.Stderr, "      --max-bytes int\n    \tmaximum bytes read per stdin, file, request, or URL body (default 4194304)")
+		fmt.Fprintln(os.Stderr, "  -s, --serve\n    \tstart HTTP service mode")
+		fmt.Fprintln(os.Stderr, "  -r, --remote\n    \tbind to an outward-facing IP address")
+		fmt.Fprintln(os.Stderr, "  -v\n    \tincrease diagnostic verbosity (repeatable)")
+		fmt.Fprintln(os.Stderr, "      --demo\n    \tstart HTTP service mode and open demo page in web browser")
+		fmt.Fprintln(os.Stderr, "      --host string\n    \thost to bind HTTP service to (default \"127.0.0.1\")")
+		fmt.Fprintln(os.Stderr, "      --port int\n    \tport to bind HTTP service to (default 9008)")
+		fmt.Fprintln(os.Stderr, "  -u, --url string\n    \tclassify the content of a URL")
+	}
+
+	os.Args = append(os.Args[:1], preprocessArgs(os.Args[1:])...)
+	flag.Parse()
+
+	actualModelPath := modelPath
+	if mPath != "" {
+		actualModelPath = mPath
+	}
+
+	formatSpecified := false
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "format" || f.Name == "f" {
+			formatSpecified = true
+		}
+	})
+
+	actualFormat := "csv"
+	if fFormat != "" {
+		actualFormat = fFormat
+	} else if format != "" {
+		actualFormat = format
+	}
+
+	if actualFormat != "classic" && actualFormat != "csv" && actualFormat != "jsonl" {
+		fmt.Fprintf(os.Stderr, "unknown output format: %s\n", actualFormat)
+		os.Exit(1)
+	}
+
+	actualBatchMode := batchMode || bMode || formatSpecified
+	actualDist := dist || dMode
+	actualNormalize := normalize || nMode
+
+	if actualBatchMode && (serve || demo) {
+		fmt.Fprintln(os.Stderr, "cannot specify both batch and serve modes")
+		os.Exit(1)
+	}
+	if lineMode && actualBatchMode {
+		fmt.Fprintln(os.Stderr, "cannot specify both line mode and batch mode at the same time")
+		os.Exit(1)
+	}
+
+	var id *py3langid.Identifier
+	var err error
+	var options []py3langid.Option
+	if actualNormalize {
+		options = append(options, py3langid.WithNormalizedProbabilities())
+	}
+
+	if actualModelPath != "" {
+		id, err = py3langid.LoadModel(actualModelPath, options...)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load model: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		id, err = py3langid.NewDefaultIdentifier(options...)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "load default model: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	if langs != "" {
+		langList := strings.Split(langs, ",")
+		for i := range langList {
+			langList[i] = strings.TrimSpace(langList[i])
+		}
+		if err := id.SetLanguages(langList...); err != nil {
+			fmt.Fprintf(os.Stderr, "filter languages: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	if verbosity > 0 {
+		fmt.Fprintf(os.Stderr, "py3langid: loaded %d output labels, normalized=%t\n", len(id.Classes()), actualNormalize)
+	}
+
+	if serve || demo {
+		actualHost := resolveServeHost(host, remote)
+
+		srv := service.NewServer(id)
+		srv.SetMaxRequestBytes(maxInputBytes)
+		if demo {
+			go openBrowser(fmt.Sprintf("http://%s:%d/demo", actualHost, port))
+		}
+		if err := srv.Start(actualHost, port); err != nil {
+			fmt.Fprintf(os.Stderr, "start service: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	actualURLTarget := urlTarget
+	if uTarget != "" {
+		actualURLTarget = uTarget
+	}
+
+	if actualURLTarget != "" {
+		uc := urlclass.NewClient(id)
+		uc.SetMaxResponseBytes(maxInputBytes)
+		if actualDist {
+			results, bodyLen, err := uc.RankURL(actualURLTarget, 10*time.Second)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "url classification: %v\n", err)
+				os.Exit(1)
+			}
+			fmt.Printf("%s %d [", actualURLTarget, bodyLen)
+			for i, r := range results {
+				if i > 0 {
+					fmt.Print(", ")
+				}
+				if actualNormalize {
+					fmt.Printf("('%s', %.4f)", r.Language, r.Score)
+				} else {
+					fmt.Printf("('%s', %.1f)", r.Language, r.Score)
+				}
+			}
+			fmt.Println("]")
+		} else {
+			if actualNormalize {
+				results, bodyLen, err := uc.RankURL(actualURLTarget, 10*time.Second)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "url classification: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Printf("%s %d ('%s', %.4f)\n", actualURLTarget, bodyLen, results[0].Language, results[0].Score)
+			} else {
+				res, bodyLen, err := uc.ClassifyURL(actualURLTarget, 10*time.Second)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "url classification: %v\n", err)
+					os.Exit(1)
+				}
+				fmt.Printf("%s %d ('%s', %.1f)\n", actualURLTarget, bodyLen, res.Language, res.Score)
+			}
+		}
+		return
+	}
+
+	if actualBatchMode {
+		var csvWriter *csv.Writer
+		var classes []string
+		if actualFormat == "csv" {
+			csvWriter = csv.NewWriter(os.Stdout)
+			defer csvWriter.Flush()
+			if actualDist {
+				classes = id.Classes()
+				header := append([]string{"path", "language"}, classes...)
+				_ = csvWriter.Write(header)
+			}
+		}
+
+		processPath := func(path string) {
+			path = strings.TrimSpace(path)
+			if path == "" {
+				return
+			}
+			if !formatSpecified {
+				info, err := os.Stat(path)
+				if err != nil || !info.Mode().IsRegular() {
+					return
+				}
+			}
+			data, err := readFileLimited(path, maxInputBytes)
+			if err != nil {
+				if ignoreMissing {
+					return
+				}
+				if actualFormat == "csv" {
+					if actualDist {
+						row := make([]string, len(classes)+2)
+						row[0] = path
+						row[1] = batchErrorCode(err)
+						_ = csvWriter.Write(row)
+					} else {
+						_ = csvWriter.Write([]string{path, batchErrorCode(err), ""})
+					}
+				} else if actualFormat == "jsonl" {
+					fmt.Printf("{\"path\":%q,\"error\":%q}\n", path, batchErrorCode(err))
+				} else {
+					fmt.Printf("%s,%s\n", path, batchErrorCode(err))
+				}
+				return
+			}
+
+			switch actualFormat {
+			case "csv":
+				if actualDist {
+					results, err := id.RankBytes(data)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "rank: %v\n", err)
+						return
+					}
+					scoreMap := make(map[string]string)
+					for _, r := range results {
+						if actualNormalize {
+							scoreMap[r.Language] = fmt.Sprintf("%.4f", r.Score)
+						} else {
+							scoreMap[r.Language] = fmt.Sprintf("%.1f", r.Score)
+						}
+					}
+					row := make([]string, 0, len(classes)+2)
+					row = append(row, path, results[0].Language)
+					for _, c := range classes {
+						row = append(row, scoreMap[c])
+					}
+					_ = csvWriter.Write(row)
+				} else {
+					var lang string
+					var confidence float64
+					if actualNormalize {
+						results, err := id.RankBytes(data)
+						if err != nil {
+							fmt.Fprintf(os.Stderr, "rank: %v\n", err)
+							return
+						}
+						lang = results[0].Language
+						confidence = results[0].Score
+					} else {
+						res, err := id.IdentifyBytes(data)
+						if err != nil {
+							fmt.Fprintf(os.Stderr, "classify: %v\n", err)
+							return
+						}
+						lang = res.Language
+						confidence = res.Score
+					}
+
+					var confStr string
+					if actualNormalize {
+						confStr = fmt.Sprintf("%.4f", confidence)
+					} else {
+						confStr = fmt.Sprintf("%.1f", confidence)
+					}
+					_ = csvWriter.Write([]string{path, lang, confStr})
+				}
+
+			case "jsonl":
+				if actualDist {
+					results, err := id.RankBytes(data)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "rank: %v\n", err)
+						return
+					}
+					type jsonlRankItem struct {
+						Language string  `json:"language"`
+						Score    float64 `json:"score"`
+					}
+					ranking := make([]jsonlRankItem, len(results))
+					for i, r := range results {
+						ranking[i] = jsonlRankItem{
+							Language: r.Language,
+							Score:    r.Score,
+						}
+					}
+					type jsonlDistRow struct {
+						Path    string          `json:"path"`
+						Ranking []jsonlRankItem `json:"ranking"`
+					}
+					row := jsonlDistRow{
+						Path:    path,
+						Ranking: ranking,
+					}
+					b, err := json.Marshal(row)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "json marshal: %v\n", err)
+						return
+					}
+					fmt.Println(string(b))
+				} else {
+					var lang string
+					var confidence float64
+					if actualNormalize {
+						results, err := id.RankBytes(data)
+						if err != nil {
+							fmt.Fprintf(os.Stderr, "rank: %v\n", err)
+							return
+						}
+						lang = results[0].Language
+						confidence = results[0].Score
+					} else {
+						res, err := id.IdentifyBytes(data)
+						if err != nil {
+							fmt.Fprintf(os.Stderr, "classify: %v\n", err)
+							return
+						}
+						lang = res.Language
+						confidence = res.Score
+					}
+
+					type jsonlClassifyRow struct {
+						Path       string  `json:"path"`
+						Language   string  `json:"language"`
+						Confidence float64 `json:"confidence"`
+					}
+					row := jsonlClassifyRow{
+						Path:       path,
+						Language:   lang,
+						Confidence: confidence,
+					}
+					b, err := json.Marshal(row)
+					if err != nil {
+						fmt.Fprintf(os.Stderr, "json marshal: %v\n", err)
+						return
+					}
+					fmt.Println(string(b))
+				}
+
+			default: // "classic"
+				fmt.Printf("%s,", path)
+				processInput(id, data, actualDist, actualNormalize)
+			}
+		}
+
+		if flag.NArg() > 0 {
+			for _, path := range flag.Args() {
+				processPath(path)
+			}
+		} else {
+			s := newScannerWithLimit(os.Stdin, maxInputBytes)
+			for s.Scan() {
+				processPath(s.Text())
+			}
+			if err := s.Err(); err != nil {
+				fmt.Fprintf(os.Stderr, "read stdin: %v\n", err)
+				os.Exit(1)
+			}
+		}
+		return
+	}
+
+	if isTerminal(int(os.Stdin.Fd())) {
+		s := newScannerWithLimit(os.Stdin, maxInputBytes)
+		fmt.Print(">>> ")
+		for s.Scan() {
+			line := s.Bytes()
+			processInput(id, line, actualDist, actualNormalize)
+			fmt.Print(">>> ")
+		}
+		if err := s.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "read stdin: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println()
+		return
+	}
+
+	if lineMode {
+		s := newScannerWithLimit(os.Stdin, maxInputBytes)
+		for s.Scan() {
+			line := s.Bytes()
+			processInput(id, line, actualDist, actualNormalize)
+		}
+		if err := s.Err(); err != nil {
+			fmt.Fprintf(os.Stderr, "read stdin: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	data, err := readAllLimited(os.Stdin, maxInputBytes)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "read stdin: %v\n", err)
+		os.Exit(1)
+	}
+	processInput(id, data, actualDist, actualNormalize)
+}
+
+func resolveServeHost(host string, remote bool) string {
+	if host != "" {
+		return host
+	}
+	if !remote {
+		return "127.0.0.1"
+	}
+
+	conn, err := net.Dial("udp", "8.8.8.8:80")
+	if err != nil {
+		return "127.0.0.1"
+	}
+	defer conn.Close()
+
+	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP != nil {
+		return addr.IP.String()
+	}
+	return "127.0.0.1"
+}
+
+func readFileLimited(path string, maxBytes int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	data, err := readAllLimited(f, maxBytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file: %w", err)
+	}
+	return data, nil
+}
+
+func readAllLimited(r io.Reader, maxBytes int64) ([]byte, error) {
+	if maxBytes <= 0 {
+		return io.ReadAll(r)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(r, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("%w: limit %d bytes", errInputTooLarge, maxBytes)
+	}
+	return data, nil
+}
+
+func newScannerWithLimit(r io.Reader, maxBytes int64) *bufio.Scanner {
+	s := bufio.NewScanner(r)
+	maxBufSize := int64(1 << 30) // 1 GiB default limit if <= 0
+	if maxBytes > 0 {
+		maxBufSize = min(maxBytes, 1<<30)
+	}
+	s.Buffer(nil, int(maxBufSize))
+	return s
+}
+
+func batchErrorCode(err error) string {
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return "NOSUCHFILE"
+	case errors.Is(err, errInputTooLarge):
+		return "INPUTTOOLARGE"
+	default:
+		return "READERR"
+	}
+}
+
+func openBrowser(url string) {
+	// Wait a brief moment to ensure the server starts listening first
+	time.Sleep(100 * time.Millisecond)
+
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "linux", "freebsd", "openbsd", "netbsd", "dragonfly":
+		cmd = exec.Command("xdg-open", url)
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default:
+		// Silent fallback on unsupported platforms
+		return
+	}
+	_ = cmd.Start()
+}
