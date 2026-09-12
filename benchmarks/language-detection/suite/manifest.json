@@ -1,0 +1,130 @@
+{
+  "name": "FLORES-200 short/medium language identification subset",
+  "source": "https://dl.fbaipublicfiles.com/nllb/flores200_dataset.tar.gz",
+  "source_sha256": "b8b0b76783024b85797e5cc75064eb83fc5288b41e9654dabc7be6ae944011f6",
+  "source_project": "https://github.com/facebookresearch/flores/tree/main/flores200",
+  "split": "devtest",
+  "license": "CC-BY-SA-4.0",
+  "license_url": "https://creativecommons.org/licenses/by-sa/4.0/",
+  "attribution": "NLLB Team et al. (2022), No Language Left Behind: Scaling Human-Centered Machine Translation",
+  "selection": "First N unique full sentences per language/group ordered by SHA256(seed:case_id); text unchanged",
+  "seed": 20260912,
+  "per_language_per_group": 25,
+  "length_groups_utf8_bytes": {
+    "short": [
+      20,
+      200
+    ],
+    "medium": [
+      201,
+      1000
+    ]
+  },
+  "maximum_utf8_bytes": 4000,
+  "languages": {
+    "ar": "arb_Arab",
+    "de": "deu_Latn",
+    "en": "eng_Latn",
+    "es": "spa_Latn",
+    "fr": "fra_Latn",
+    "hi": "hin_Deva",
+    "id": "ind_Latn",
+    "it": "ita_Latn",
+    "ja": "jpn_Jpan",
+    "ko": "kor_Hang",
+    "nl": "nld_Latn",
+    "pl": "pol_Latn",
+    "pt": "por_Latn",
+    "ru": "rus_Cyrl",
+    "sv": "swe_Latn",
+    "th": "tha_Thai",
+    "tr": "tur_Latn",
+    "uk": "ukr_Cyrl",
+    "vi": "vie_Latn",
+    "zh": "zho_Hans"
+  },
+  "eligible_counts": {
+    "ar": {
+      "short": 516,
+      "medium": 496
+    },
+    "de": {
+      "short": 834,
+      "medium": 178
+    },
+    "en": {
+      "short": 951,
+      "medium": 61
+    },
+    "es": {
+      "short": 820,
+      "medium": 192
+    },
+    "fr": {
+      "short": 780,
+      "medium": 232
+    },
+    "hi": {
+      "short": 128,
+      "medium": 884
+    },
+    "id": {
+      "short": 901,
+      "medium": 111
+    },
+    "it": {
+      "short": 837,
+      "medium": 175
+    },
+    "ja": {
+      "short": 774,
+      "medium": 238
+    },
+    "ko": {
+      "short": 826,
+      "medium": 186
+    },
+    "nl": {
+      "short": 873,
+      "medium": 139
+    },
+    "pl": {
+      "short": 877,
+      "medium": 135
+    },
+    "pt": {
+      "short": 879,
+      "medium": 133
+    },
+    "ru": {
+      "short": 282,
+      "medium": 730
+    },
+    "sv": {
+      "short": 922,
+      "medium": 90
+    },
+    "th": {
+      "short": 84,
+      "medium": 928
+    },
+    "tr": {
+      "short": 883,
+      "medium": 129
+    },
+    "uk": {
+      "short": 336,
+      "medium": 676
+    },
+    "vi": {
+      "short": 663,
+      "medium": 349
+    },
+    "zh": {
+      "short": 959,
+      "medium": 53
+    }
+  },
+  "sample_count": 1000,
+  "suite_sha256": "ec0ea263e5cdea41005cb2bc9fff1612e2b5a937c319a7c25162d2ad8b00e7a5"
+}

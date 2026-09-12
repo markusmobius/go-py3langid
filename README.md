@@ -176,7 +176,7 @@ They are regression tests, not a representative held-out accuracy dataset.
 | Explicit expected-language assertions | 19/19 in both implementations |
 | Unmodified upstream tests, executed under Python | 28 inference/CLI + 14 HTTP test instances pass |
 | Native Go tests | Inference, CLI, HTTP, URL, model decoding, and concurrency checks |
-| Representative held-out accuracy | Not measured |
+| Separate FLORES-200 comparison | [1,000 cases across 20 selected languages](benchmarks/language-detection/README.md); not full-language coverage |
 
 The 19 assertions include duplicates, language restrictions, and `zxx`; only four
 unrestricted natural-language labels are represented. **42/42 agreement is not
@@ -184,6 +184,52 @@ unrestricted natural-language labels are represented. **42/42 agreement is not
 port claims tested behavioral agreement, not better language accuracy. For
 example, upstream classifies `hello world` as `fuv` with low confidence; Go
 intentionally preserves that result.
+
+## Language Detector Comparison
+
+[benchmarks/language-detection](benchmarks/language-detection/README.md) compares
+this library with `jmhodges/gocld3`, `RadhiFadlillah/whatlanggo`, and
+`pemistahl/lingua-go` in one four-engine run. All adapters share one isolated
+benchmark worker module and persistent protocol, and are built from source for
+native Linux. No executables are bundled. With the documented Linux build
+prerequisites installed, run:
+
+```sh
+bash benchmarks/language-detection/run.sh
+```
+
+The corpus contains **1,000 short/medium sentences from 20 selected FLORES-200
+languages, not the full FLORES-200 language inventory**. All four detectors
+support these 20 languages, so each is evaluated on the exact same sentences.
+Each detector still considers its full supported language set when predicting.
+
+Fresh results from 2026-09-12 on WSL2 Linux/AMD64, AMD Ryzen AI 7 PRO 350,
+Go 1.26.0, Python 3.14.4, and `GOMAXPROCS=1`:
+
+| Engine | Pure Go | Supported languages | Accuracy | Startup (s) | Warm-up total (s) | Median pass (s) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| CLD3 | No (CGO) | 103 | 98.4% | 0.0474 | 0.6154 | 0.4546 |
+| go-py3langid | Yes | 139 | 99.2% | 0.4007 | 0.6579 | 0.4982 |
+| Whatlanggo | Yes | 84 | 98.4% | 0.0394 | 0.7823 | 0.5724 |
+| Lingua | Yes | 75 | 98.7% | 0.0634 | 11.1091 | 2.3587 |
+
+**Pure Go:** CLD3 uses native C++ through CGO; the other three workers are built
+with `CGO_ENABLED=0`.
+
+Language counts group script variants and exclude non-language classes: CLD3
+has 109 raw output labels and py3langid has 140 classes including `zxx`. The
+supported-language column describes model coverage, not the number tested.
+
+Workers stay alive across all phases. **Startup** is launch-to-ready;
+**warm-up total** is one separately timed, discarded 1,000-text pass, including
+Lingua's lazy model loading. **Median pass** covers only the eight subsequent
+1,000-text passes with rotating engine order, excluding both startup and warm-up.
+Wall time includes Python, JSON, and TCP overhead. See the
+[individual pass times](benchmarks/language-detection/results/2026-09-12/report.md#pass-wall-times)
+and benchmark methodology before generalizing accuracy or small timing
+differences. This is an opt-in experiment, not a production-throughput claim or
+CI performance threshold. Ordinary Go tests remain independent of CGO, Protobuf,
+Python, and the benchmark detector dependencies.
 
 ## Development And Upstream Sync
 
@@ -218,3 +264,9 @@ the single [BSD 3-Clause LICENSE](LICENSE), retaining credits for **Marco Lui**,
 was by Marco Lui and Tim Baldwin. This project builds on the earlier Go port by
 Ilya Pyshkin and tracks Adrien Barbaresi's py3langid project. Go module dependencies
 retain their own licenses.
+
+The optional language-detector benchmark adds separately licensed assets: FLORES-200
+sentences and text-containing result CSVs retain CC-BY-SA 4.0, and its dependencies
+retain their own licenses. See [benchmark licensing](benchmarks/language-detection/README.md#licensing)
+and [corpus licensing](benchmarks/language-detection/suite/README.md); the library's BSD license
+does not replace those terms.

@@ -1,0 +1,7 @@
+*.py text eol=lf
+*.sh text eol=lf
+*.go text eol=lf
+suite/*.jsonl text eol=lf
+suite/*.json text eol=lf
+suite/SOURCE_README.txt -text
+results/** text eol=lf
